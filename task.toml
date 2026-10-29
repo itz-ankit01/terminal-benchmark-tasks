@@ -1,0 +1,34 @@
+artifacts = ["/app/recovery.cpp"]
+
+[task]
+name = "terminal-use-agents/page-store-recovery"
+description = "Implement crash recovery for a small write-ahead-logged page store in C++17: redo, rollback with compensation records, prepared transactions, nested top actions, log truncation and moved items, staying correct when recovery itself is interrupted."
+
+[metadata]
+author_name = "Author"
+author_email = "anonymous@example.invalid"
+author_organization = ""
+difficulty = "hard"
+difficulty_explanation = "Recovery must produce a storage history that a device accepts action by action and that stays valid when the process dies after any action and restarts from whatever survived. Several mechanisms interact: per-item locking on shared pages, so winners and losers mix inside one page image; pages persisted at different points in a log that may be truncated at the front; partial rollbacks and nested top actions, which decide what remains to undo; prepared transactions that need outside decisions; and store-level SWAP records that move items between cells and pages, so a compensation must target the item's current cell rather than the cell its update wrote. Restart states may come from interrupted recovery attempts by other software, so the solution cannot rely on its own action order, and a watchdog may stop every attempt after 16 actions, so the simple plan of appending everything, syncing once and then writing pages livelocks: each attempt must make durable progress early while every prefix stays valid."
+solution_explanation = "The reference rebuilds the transaction table from the retained log, redoes every page from its own LSN (applying each SWAP to both cells), then ends committed transactions, applies outside decisions and rolls back losers by walking each undo chain, skipping compensated updates and closed nested top actions. Each CLR is aimed at the cell that holds the item after all later SWAPs, appended, synchronized and only then reflected in a page write, so every attempt makes durable progress within its first few actions. A second, independently written implementation that undoes in one global backward pass across transactions, syncs after each append and writes each page once at the end also passes."
+verification_explanation = "The verifier compiles the single submitted file with trusted copies of api.hpp and driver.cpp. On Linux the compiler and worker run as nobody; the worker may not create file contents (RLIMIT_FSIZE 0, output through a pipe) and runs with 10 s CPU and 512 MiB address space. A Python virtual device checks every action: LSN allocation, transaction chains, which records recovery may append and when, exact CLR fields including the moved cell, synchronization points, write-ahead ordering and that each written page is an exact logged version. Expected cell values come from a forward history generator that tracks committed values while it writes the history, not from a recovery algorithm; a separate development checker re-derived them independently. Test groups: 20 hand-computed histories, 96 generated histories, restart after every action prefix of short traces, 48 restart states produced by a random legal-action walker, a watchdog run that cuts every attempt after 16 actions and requires durable progress each time, repeated interruptions, idempotence of every completed run, and histories near 4096 records with LSNs crossing and near the top of the unsigned range. Two correct implementations pass; the empty stub and 14 targeted faulty variants fail. Inside the Linux image the worker cannot read /tests and is killed if it writes a file."
+category = "Software"
+subcategory = "transactional storage / crash recovery"
+tags = ["cpp", "storage", "crash-recovery", "transactions", "write-ahead-log", "aries"]
+expert_time_estimate_hours = 6
+relevant_experience = "Write-ahead logging and ARIES-style recovery, transactional storage engines, crash-injection testing."
+
+[verifier]
+timeout_sec = 600.0
+environment_mode = "separate"
+
+[agent]
+timeout_sec = 72000.0
+
+[environment]
+build_timeout_sec = 6000.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 0
+network_mode = "no-network"

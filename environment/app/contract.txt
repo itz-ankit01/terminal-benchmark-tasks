@@ -1,0 +1,224 @@
+PAGE STORE RECOVERY CONTRACT
+
+1. The job
+
+Write the restart recovery routine of a small transactional page store:
+
+    std::vector<pager::Action> pager::recover(const pager::Image& image);
+
+The types are declared in api.hpp. After a crash, recover() receives the
+durable state of the store and returns a list of storage actions. A virtual
+storage device applies the actions in order and rejects any action this
+contract does not allow.
+
+recover() must not do I/O, start processes or keep anything between calls.
+Its output may depend only on the Image it receives. recovery.cpp is built as
+C++17 together with the provided driver.cpp and api.hpp, using only the
+standard library. A failed build, an exception, a nonzero exit status or a
+rejected action is a failure. Any sequence of actions that follows these rules
+and reaches the required result is accepted.
+
+2. Pages, cells and items
+
+The store has 1 to 64 pages; page p is Image.pages[p]. A page holds an
+unsigned 64-bit LSN and eight cells, each holding a signed 64-bit value. A
+page is always written to stable storage whole and atomically.
+
+The store sometimes reorganizes itself by exchanging the contents of two
+cells (a SWAP record). To follow data as it moves, think of each cell as
+holding one item. UPDATE and CLR records change the value of the item in a
+cell. A SWAP exchanges the items of two cells, values and all, so after it the
+item that was in one cell is in the other. Items never move in any other way.
+
+A log record touches page p if it is an UPDATE or CLR whose page is p, or a
+SWAP whose page or page2 is p. This holds even when the record leaves every
+value unchanged. Applying a SWAP to page p sets just those of its two cells
+that are on page p, to the values given in the record.
+
+Image.base_lsn is a checkpoint. When it was taken no transaction was running
+and every page had some contents, not necessarily zeros. Version L of page p
+is what you get by starting from the checkpoint contents of page p and applying
+every record that touches page p with LSN at most L, in LSN order; its page
+LSN is L. This counts every record that was ever durable, including records
+later removed by truncation (section 3). Only base_lsn and the LSNs of such
+records that touch page p name versions of page p.
+
+Each entry of Image.pages is some version of its page, and different pages can
+be at different versions. A page may hold changes of transactions that never
+committed, and may lack changes of transactions that did. Every record a page
+version contains was durable before that version was written.
+
+3. Log records
+
+Image.log is the durable log in increasing LSN order. LSNs are greater than
+base_lsn, strictly increasing and may have gaps. They can exceed INT64_MAX and
+stay below UINT64_MAX - 1000000. No record has LSN 0; in a pointer field, 0
+means "none".
+
+A record has the fields lsn, kind, tx, prev, undo, page, slot, before, after,
+target, page2 and slot2. Except for SWAP, every record belongs to the
+transaction tx, a positive 32-bit ID that is never reused. prev is the LSN of
+the previous record of the same transaction, or 0 for its first record, so
+each transaction's records form a chain. A transaction begins with its first
+record. Fields not listed for a kind are 0.
+
+  1 UPDATE   Assigns `after` to the item in cell `slot` of page `page`.
+             `before` is the value the cell held just before. The two may be
+             equal.
+  2 CLR      Compensates the UPDATE whose LSN is `target`. It assigns that
+             UPDATE's before value to the item the UPDATE changed, in whatever
+             cell holds that item when the CLR is written; page and slot name
+             that cell. after is the UPDATE's before value, before is 0, and
+             undo is the UPDATE's prev.
+  3 COMMIT   The transaction has committed.
+  4 ABORT    The transaction is rolling back completely.
+  5 END      The transaction is finished. It writes nothing after END.
+  6 PREPARE  The transaction is prepared and waits for an outside decision.
+  7 NESTED   Closes a nested top action. undo is the LSN of the
+             transaction's record just before the action began, or 0 if the
+             action began the transaction.
+  8 SWAP     Exchanges the items in cell `slot` of page `page` and cell
+             `slot2` of page `page2`; the two cells are different. before is
+             the value that was in the first cell and moves to the second;
+             after is the value that was in the second cell and moves to the
+             first. A SWAP is written by the store itself, not by a
+             transaction: tx, prev, undo and target are 0. It is never undone.
+
+A transaction's state comes from the latest of its COMMIT, ABORT, PREPARE and
+END records: committed, in ABORT state, prepared or ended. With none of them it
+is active. An active transaction may write UPDATE, CLR, NESTED, COMMIT, ABORT
+or PREPARE. A prepared transaction may write only COMMIT or ABORT. A committed
+transaction may write only END. A transaction in ABORT state may write only
+CLR and, once nothing is left to roll back, END.
+
+Rolling back compensates a transaction's UPDATEs one at a time with CLRs,
+newest first. An UPDATE that already has a CLR is never compensated again,
+and neither is an UPDATE inside a closed nested top action; CLRs themselves
+are never compensated. The UPDATEs that remain are the transaction's rollback
+work. An active transaction may roll back only part of that work and then go
+on with new updates.
+
+A nested top action is one or more UPDATEs of a transaction closed by a
+NESTED record of the same transaction. Its UPDATEs are exactly the records of
+that transaction after the one named by NESTED.undo (from its first record if
+undo is 0) and before the NESTED record; no other kind of record of that
+transaction falls in between. Once the NESTED record exists, these changes are
+permanent: they are kept whatever happens to the transaction later. Updates
+with no NESTED record closing them are ordinary updates.
+
+Locking is per item. An item owned by one transaction is never changed by
+another. A transaction owns each item it changes outside a nested top action
+until its END, including while it is prepared and after it has partly rolled
+back. A nested top action changes only items that no transaction, including
+its own, owned when the action began; the transaction owns them until the
+NESTED record releases them. It can change them again later and then owns them
+as usual. Moving an item with a SWAP does not change who owns it.
+
+The log may have been truncated at the front, so records up to some LSN can
+be missing. Truncation never removes a record of a transaction that has no END
+record, and never removes a record whose LSN is higher than the stable LSN of
+a page it touches.
+
+4. Outside decisions
+
+Image.decisions maps a transaction ID to 1 (commit) or 2 (abort). Every
+transaction listed there has a durable PREPARE record, which truncation may
+since have removed along with the rest of the transaction. When recovery runs,
+the transaction may still be prepared, or the decision may already have been
+carried out, so that it has committed, is rolling back or has ended. A
+prepared transaction with no decision stays prepared.
+
+5. Required result
+
+When recover() returns and the device has applied all of its actions:
+
+  - A transaction is a winner if it has a COMMIT record or is prepared with a
+    commit decision. Every other transaction, except a prepared one with no
+    decision, is a loser.
+  - Every winner and every loser has an END record. Losers have been rolled
+    back completely, so none of their rollback work is left.
+  - Prepared transactions with no decision get no new records and are still
+    prepared, with their changes in place.
+  - Every log record recover() appended is durable.
+  - Every stable page contains every log record that touches it: its LSN is
+    at least the LSN of each of those records.
+  - Calling recover() again on the resulting state would append no records.
+    Rewriting a page with identical contents is fine.
+
+6. Storage actions
+
+An Action's op is 'A', 'F' or 'P'. Fields the op does not use are ignored.
+
+A  Append Action.record to the log buffer in memory. Its lsn must be one more
+   than the LSN of the last record in the log, durable or buffered. Its prev
+   must be the LSN of its transaction's latest record. The transaction must
+   already appear in the log and must not have ended. Recovery may append only:
+     ABORT   for an active transaction, or for a prepared one with an abort
+             decision;
+     COMMIT  for a prepared transaction with a commit decision;
+     CLR     for a transaction in ABORT state with rollback work left; it must
+             compensate the newest UPDATE of that work, with the fields
+             described in section 3;
+     END     for a committed transaction, or for one in ABORT state with no
+             rollback work left.
+   All fields not described for the kind, including page2 and slot2, are 0.
+
+F  Make the log durable through Action.upto. upto must be the LSN of a record
+   in the log at or after the last durable record. That record and everything
+   before it become durable; later records stay in the buffer. F writes no
+   pages.
+
+P  Write Action.page to stable storage as page Action.page_id. The page must
+   exist, and Action.page must be exactly a version of that page (section 2).
+   Its LSN may not be lower than the LSN of the page now in stable storage, and
+   may not be higher than the LSN of the last durable log record. Rewriting
+   the version that is already in stable storage is always allowed.
+
+7. Crashes
+
+The device can crash after any prefix of the returned actions, including the
+empty prefix and the complete list. A crash loses buffered log records and
+keeps durable records and finished page writes. recover() is then called in a
+fresh process with what survived and the same decisions. This can repeat any
+number of times before a call is allowed to finish. The Image may also come
+from a crash during an earlier recovery attempt made by different software; all
+you can rely on is that every earlier action followed this contract.
+
+A watchdog may also stop any attempt once its first 16 actions have taken
+effect, which is the same as a crash at that point. Recovery must finish even
+if this happens to every attempt. So whenever work is left (a transaction
+other than an undecided prepared one has no END record, or a stable page's LSN
+is below that of a log record that touches it), the first 16 actions recover()
+returns must include an F that makes at least one more record durable or a P
+that raises the LSN of a stable page.
+
+There are no torn pages, no media errors and no concurrent foreground work.
+
+8. Limits
+
+At most 64 pages and 128 transaction IDs. A history written before the first
+recovery attempt has at most 4096 records; with records added by interrupted
+recovery attempts, the log can hold up to 32768. The log may be empty, and
+there may be nothing to do.
+
+The driver rejects more than 12 * (input log records) + 8 * 128 + 2 * (pages)
+actions. Each recover() call has 10 seconds of CPU time, 512 MiB of address
+space and 16 MiB of output. The build has 60 seconds.
+
+9. Driver format
+
+driver.cpp reads decimal numbers separated by whitespace:
+
+  base_lsn page_count record_count decision_count
+  for each page:      page_lsn cell0 ... cell7
+  for each record:    lsn kind tx prev undo page slot before after target
+                      page2 slot2
+  for each decision:  tx decision
+
+and prints one action per line, with no count first:
+
+  A lsn kind tx prev undo page slot before after target page2 slot2
+  F upto
+  P page_id page_lsn cell0 ... cell7
+
+Implement recover(); do not write a second main() or replace the driver.
